@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from miner_reference.threejs_placeholder import generate_car_scene
+from miner_reference.generation_pipeline import generate_scene_for_prompt, load_models
 
 
 class PodStatus(StrEnum):
@@ -103,6 +103,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting up...")
 
     await _run_gpu_benchmark(state)
+    await asyncio.to_thread(load_models)
+
 
     state.status = PodStatus.READY
     logger.info("Ready for batches")
@@ -331,7 +333,7 @@ async def _run_generation(state: MinerState, seed: int) -> None:
 
         for i, prompt in enumerate(state.prompts):
             try:
-                scene_bytes = generate_car_scene()
+                scene_bytes = await asyncio.to_thread(generate_scene_for_prompt, prompt.image_url, seed)
                 state.results[prompt.stem] = scene_bytes
             except Exception as e:
                 state.failed[prompt.stem] = str(e)
