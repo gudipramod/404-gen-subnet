@@ -13,7 +13,9 @@ from loguru import logger
 from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 
 VLM_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
+VLM_MODEL_REVISION = "eed13092ef92e448dd6875b2a00151bd3f7db0ac"
 CODE_MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
+CODE_MODEL_REVISION = "aedcc2d42b622764e023cf882b6652e646b95671"
 
 _MINER_REFERENCE_ROOT = Path(__file__).resolve().parent.parent
 _AGENTS_MD_PATH = _MINER_REFERENCE_ROOT / "AGENTS.md"
@@ -28,14 +30,14 @@ _state = {"vlm": None, "vlm_processor": None, "code_model": None, "code_tokenize
 def load_models() -> None:
     """Load VLM and code-LLM once. Call during pod warmup."""
     logger.info(f"Loading VLM: {VLM_MODEL_ID}")
-    _state["vlm_processor"] = AutoProcessor.from_pretrained(VLM_MODEL_ID)
+    _state["vlm_processor"] = AutoProcessor.from_pretrained(VLM_MODEL_ID, revision=VLM_MODEL_REVISION)
     _state["vlm"] = Qwen2VLForConditionalGeneration.from_pretrained(
-        VLM_MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda"
+        VLM_MODEL_ID, revision=VLM_MODEL_REVISION, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     logger.info(f"Loading code LLM: {CODE_MODEL_ID}")
-    _state["code_tokenizer"] = AutoTokenizer.from_pretrained(CODE_MODEL_ID)
+    _state["code_tokenizer"] = AutoTokenizer.from_pretrained(CODE_MODEL_ID, revision=CODE_MODEL_REVISION)
     _state["code_model"] = AutoModelForCausalLM.from_pretrained(
-        CODE_MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda"
+        CODE_MODEL_ID, revision=CODE_MODEL_REVISION, torch_dtype=torch.bfloat16, device_map="cuda"
     )
     logger.info("Models loaded and ready")
 
@@ -179,3 +181,37 @@ def generate_scene_for_prompt(image_url: str, seed: int) -> bytes:
         f"Failed to produce valid module after {MAX_VALIDATION_RETRIES} attempts. "
         f"Last error: {feedback}"
     )
+
+
+import os
+import boto3
+from botocore.config import Config
+
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "ac27d7f3a7bc16bb086351e7f520d56b")
+R2_BUCKET = os.environ.get("R2_BUCKET", "node6-sn17")
+R2_PUBLIC_URL_BASE = os.environ.get("R2_PUBLIC_URL_BASE", "https://pub-1d1eece1ca024d94b6b52cf0e7945c72.r2.dev")
+
+def _get_r2_client():
+    access_key = os.environ["R2_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+        region_name="auto",
+    )
+
+
+def upload_to_r2(stem: str, js_bytes: bytes, round_id: str) -> str:
+    """Upload a generated .js file to R2, return its public CDN URL."""
+    client = _get_r2_client()
+    key = f"rounds/{round_id}/{stem}.js"
+    client.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=js_bytes,
+        ContentType="application/javascript",
+    )
+    return f"{R2_PUBLIC_URL_BASE}/{key}"
