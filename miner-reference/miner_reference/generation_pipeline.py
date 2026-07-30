@@ -28,18 +28,19 @@ _state = {"vlm": None, "vlm_processor": None, "code_model": None, "code_tokenize
 
 
 def load_models() -> None:
-    """Load VLM and code-LLM once. Call during pod warmup."""
+    """Load VLM once. Call during pod warmup.
+    NOTE: code-LLM (Qwen3.6-35B-A3B-NVFP4) is served separately via vLLM
+    (see VLLM_ENDPOINT) -- not loaded here. Start that server independently:
+      vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4 \
+        --reasoning-parser qwen3 \
+        --default-chat-template-kwargs '{"enable_thinking": false}'
+    """
     logger.info(f"Loading VLM: {VLM_MODEL_ID}")
     _state["vlm_processor"] = AutoProcessor.from_pretrained(VLM_MODEL_ID, revision=VLM_MODEL_REVISION)
     _state["vlm"] = Qwen2VLForConditionalGeneration.from_pretrained(
         VLM_MODEL_ID, revision=VLM_MODEL_REVISION, torch_dtype=torch.bfloat16, device_map="cuda"
     )
-    logger.info(f"Loading code LLM: {CODE_MODEL_ID}")
-    _state["code_tokenizer"] = AutoTokenizer.from_pretrained(CODE_MODEL_ID, revision=CODE_MODEL_REVISION)
-    _state["code_model"] = AutoModelForCausalLM.from_pretrained(
-        CODE_MODEL_ID, revision=CODE_MODEL_REVISION, torch_dtype=torch.bfloat16, device_map="cuda"
-    )
-    logger.info("Models loaded and ready")
+    logger.info("VLM loaded and ready (code-LLM served via vLLM separately)")
 
 
 def _download_image(url: str) -> Image.Image:
@@ -80,15 +81,39 @@ def _analyze_image(image: Image.Image) -> str:
 
 
 def _extract_js_code(text: str) -> str:
-    """Pull the JS module out of a code-fenced or raw LLM response."""
+    """Pull the JS module out of a code-fenced or raw LLM response.
+    Handles: properly closed fences, fences missing a closing marker
+    (response cut off), and raw unfenced code. Logs a warning whenever
+    it can't find a clean fence, since falling back to raw text risks
+    including conversational preamble that breaks JS parsing.
+    """
     match = re.search(r"```(?:js|javascript)?\s*\n(.*?)```", text, re.DOTALL)
     if match:
         return match.group(1).strip()
+
+    open_match = re.search(r"```(?:js|javascript)?\s*\n(.*)", text, re.DOTALL)
+    if open_match:
+        logger.warning("Code fence opened but not closed -- using content after opening fence only")
+        return open_match.group(1).strip()
+
+    logger.warning(f"No code fence found in response, attempting keyword-based extraction. Raw response start: {text[:200]!r}")
+    code_start = re.search(r"^(export\s+default\s+function|function|const|class)\s", text, re.MULTILINE)
+    if code_start:
+        return text[code_start.start():].strip()
+
+    logger.warning("No fence or code keyword found -- returning raw text as last resort")
     return text.strip()
 
 
+VLLM_ENDPOINT = "http://localhost:8000/v1/chat/completions"
+VLLM_MODEL_NAME = "unsloth/Qwen3.6-35B-A3B-NVFP4"
+
 def _generate_code(description: str, seed: int, feedback: str | None = None) -> str:
-    """Code-LLM pass: structural description -> generate.js source."""
+    """Code-LLM pass: structural description -> generate.js source.
+    Calls the locally-running vLLM server (NVFP4-quantized Qwen3.6-35B-A3B)
+    instead of a local transformers model -- ~60x faster on this hardware,
+    per benchmarking done 2026-07-30.
+    """
     agents_spec = _AGENTS_MD_PATH.read_text()
 
     system_prompt = (
@@ -112,19 +137,19 @@ def _generate_code(description: str, seed: int, feedback: str | None = None) -> 
             f"corrected module."
         )
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    tokenizer = _state["code_tokenizer"]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    with torch.no_grad():
-        output_ids = _state["code_model"].generate(
-            **inputs, max_new_tokens=2000, temperature=0.3, do_sample=True
-        )
-    generated = output_ids[:, inputs["input_ids"].shape[1]:]
-    response = tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+    payload = {
+        "model": VLLM_MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 2000,
+        "temperature": 0.3,
+    }
+
+    resp = requests.post(VLLM_ENDPOINT, json=payload, timeout=120)
+    resp.raise_for_status()
+    response = resp.json()["choices"][0]["message"]["content"]
     return _extract_js_code(response)
 
 

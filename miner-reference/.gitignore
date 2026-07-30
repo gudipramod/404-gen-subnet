@@ -1,0 +1,7 @@
+
+# vLLM environment and logs
+.venv-vllm/
+vllm_serve_log*.txt
+dry_run_full_test_log.txt
+extraction_fix_test.log
+test_hybrid_output.js
