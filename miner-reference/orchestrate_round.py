@@ -182,6 +182,16 @@ def main():
         print("No successful generations -- aborting, nothing to submit.", flush=True)
         return
 
+    # Save all generated files locally BEFORE attempting upload, so a
+    # crash (e.g. missing R2 credentials) never loses completed generation work.
+    import os as _os
+    local_backup_dir = f"round_{round_num}_output"
+    _os.makedirs(local_backup_dir, exist_ok=True)
+    for stem, js_bytes in results.items():
+        with open(f"{local_backup_dir}/{stem}.js", "wb") as f:
+            f.write(js_bytes)
+    print(f"Saved {len(results)} files locally to {local_backup_dir}/ before upload attempt", flush=True)
+
     cdn_url = upload_all(results, round_num)
     commit_sha = get_latest_commit_sha()
     print(f"Repo commit SHA: {commit_sha}", flush=True)
