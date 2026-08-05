@@ -155,8 +155,29 @@ def commit_submission(commit_sha: str, cdn_url: str) -> None:
     print(f"Commit result: {success}", flush=True)
 
 
+def _load_r2_credentials_from_file():
+    """Load R2 credentials directly from a fixed file path, bypassing
+    shell/tmux environment inheritance entirely. This exists because
+    relying on .bashrc + tmux session startup proved unreliable in
+    practice -- it silently failed for BOTH round 30 and round 31,
+    even when .bashrc was edited well before the session was created.
+    """
+    import os
+    cred_path = os.path.expanduser("~/.r2_credentials")
+    if not os.path.exists(cred_path):
+        return
+    with open(cred_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ[key.strip()] = value.strip()
+
+
 def main():
     import os
+    _load_r2_credentials_from_file()
     # Fail fast, before polling/generating anything, if R2 credentials
     # are missing. This exact gap cost rounds 30 AND 31 -- files were
     # generated successfully but upload crashed with a KeyError, either
