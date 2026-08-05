@@ -156,6 +156,21 @@ def commit_submission(commit_sha: str, cdn_url: str) -> None:
 
 
 def main():
+    import os
+    # Fail fast, before polling/generating anything, if R2 credentials
+    # are missing. This exact gap cost rounds 30 AND 31 -- files were
+    # generated successfully but upload crashed with a KeyError, either
+    # losing the work entirely (round 30, before the local-save fix) or
+    # leaving it stranded on disk after the reveal window closed (round 31).
+    missing = [v for v in ("R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY") if not os.environ.get(v)]
+    if missing:
+        print(f"FATAL: Missing required environment variable(s): {missing}", flush=True)
+        print("Set them before running, e.g.:", flush=True)
+        print('  export R2_ACCESS_KEY_ID="..."', flush=True)
+        print('  export R2_SECRET_ACCESS_KEY="..."', flush=True)
+        raise SystemExit(1)
+    print("R2 credentials verified present.", flush=True)
+
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
