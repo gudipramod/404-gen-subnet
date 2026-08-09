@@ -203,9 +203,22 @@ def main():
         state = get_state()
         round_num = state["current_round"]
         print("Skipping wait, using current round " + str(round_num) + " (stage=" + state["stage"] + ")", flush=True)
-    else:
-        round_num = wait_for_miner_generation_stage()
+        _process_one_round(round_num, args)
+        return
 
+    while True:
+        try:
+            round_num = wait_for_miner_generation_stage()
+            _process_one_round(round_num, args)
+        except Exception as e:
+            print(f"ERROR processing round: {e}", flush=True)
+            import traceback
+            traceback.print_exc()
+            print("Recovering -- resuming poll for the next round in 60s...", flush=True)
+            time.sleep(60)
+
+
+def _process_one_round(round_num, args):
     seed, prompts = fetch_round_data(round_num)
 
     if args.max_prompts:
