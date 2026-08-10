@@ -197,7 +197,22 @@ def main():
         print('  export R2_ACCESS_KEY_ID="..."', flush=True)
         print('  export R2_SECRET_ACCESS_KEY="..."', flush=True)
         raise SystemExit(1)
-    print("R2 credentials verified present.", flush=True)
+
+    # Length check, not just presence -- a quoted value in the credentials
+    # file (KEY="value") silently inflated a 32-char key to 34 chars and
+    # passed the presence-only check above, wasting a full 128-prompt
+    # generation cycle before failing at the final upload step and costing
+    # round 33 entirely (window closed during the fix). Cloudflare R2
+    # access keys are always exactly 32 chars, secret keys exactly 64.
+    access_key = os.environ["R2_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
+    if len(access_key) != 32 or len(secret_key) != 64:
+        print(f"FATAL: R2 credentials present but WRONG LENGTH "
+              f"(access_key={len(access_key)}, expected 32; "
+              f"secret_key={len(secret_key)}, expected 64). "
+              f"Check ~/.r2_credentials for stray quotes/whitespace.", flush=True)
+        raise SystemExit(1)
+    print("R2 credentials verified present AND correctly formatted.", flush=True)
 
     import argparse
     parser = argparse.ArgumentParser()
