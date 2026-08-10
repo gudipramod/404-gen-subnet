@@ -172,7 +172,14 @@ def _load_r2_credentials_from_file():
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            os.environ[key.strip()] = value.strip()
+            value = value.strip()
+            # Strip a matching pair of surrounding quotes, e.g. KEY="abc"
+            # -- this exact bug (quotes counted as part of the key value,
+            # inflating a 32-char key to 34 chars) cost a full 128-prompt
+            # generation cycle before failing at the upload step.
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            os.environ[key.strip()] = value
 
 
 def main():
