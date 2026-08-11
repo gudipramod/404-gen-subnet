@@ -241,6 +241,42 @@ def main():
 
 
 def _process_one_round(round_num, args):
+    # PRE-FLIGHT CHECK: verify the reveal window is genuinely open and has
+    # meaningful time remaining BEFORE starting a ~2.5 hour generation run.
+    # Round 33 cost us: generation succeeded, but the reveal window had
+    # already closed by the time we reached the commit step -- 121/128
+    # valid files generated with nowhere to submit them. A round's
+    # "miner_generation" stage label does not guarantee the separate
+    # reveal/commit window is still open.
+    try:
+        schedule_resp = get_round_file(round_num, "schedule.json")
+        schedule_resp.raise_for_status()
+        schedule = schedule_resp.json()
+        earliest = schedule["earliest_reveal_block"]
+        latest = schedule["latest_reveal_block"]
+
+        subtensor = bt.subtensor(network=NETWORK)
+        current_block = subtensor.block
+
+        MIN_BLOCKS_BUFFER = 500  # rough safety margin for generation + upload time
+        blocks_remaining = latest - current_block
+
+        print(f"Pre-flight: round {round_num} reveal window [{earliest}, {latest}], "
+              f"current block {current_block}, {blocks_remaining} blocks remaining", flush=True)
+
+        if current_block > latest:
+            print(f"SKIPPING round {round_num}: reveal window already closed "
+                  f"(current={current_block}, latest={latest}). Not starting generation.", flush=True)
+            return
+        if blocks_remaining < MIN_BLOCKS_BUFFER:
+            print(f"SKIPPING round {round_num}: only {blocks_remaining} blocks remain in "
+                  f"reveal window (need at least {MIN_BLOCKS_BUFFER} for generation+upload+commit). "
+                  f"Not starting generation.", flush=True)
+            return
+    except Exception as e:
+        print(f"WARNING: Pre-flight reveal-window check failed ({e}) -- "
+              f"proceeding anyway, but this round may be unsubmittable.", flush=True)
+
     seed, prompts = fetch_round_data(round_num)
 
     if args.max_prompts:
