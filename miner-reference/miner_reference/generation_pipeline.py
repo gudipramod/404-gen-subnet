@@ -6,16 +6,23 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
+import base64
+import io
+import os
+
 import requests
-import torch
 from PIL import Image
 from loguru import logger
-from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer, Qwen2VLForConditionalGeneration
 
-VLM_MODEL_ID = "Qwen/Qwen2-VL-7B-Instruct"
-VLM_MODEL_REVISION = "eed13092ef92e448dd6875b2a00151bd3f7db0ac"
-CODE_MODEL_ID = "Qwen/Qwen2.5-Coder-14B-Instruct"
-CODE_MODEL_REVISION = "aedcc2d42b622764e023cf882b6652e646b95671"
+# Both stages (image analysis + code synthesis) run on the SAME already-running
+# vLLM server -- the shared "Quick" tier. It is natively vision-capable, so no
+# separate VLM is loaded here: no local weights, no extra VRAM, no second model.
+LLM_ENDPOINT = os.environ.get("SN17_LLM_ENDPOINT", "http://127.0.0.1:8000/v1/chat/completions")
+LLM_MODEL_NAME = os.environ.get("SN17_LLM_MODEL", "qwen3.6-35b")
+LLM_MAX_IMAGE_PX = 768  # downscale before send; keeps prompt tokens sane
+# 2000 truncated complex objects mid-file (finish_reason=length -> PARSE_ERROR).
+# Measured: a compliant SUV/clock module needs ~3.4k tokens.
+LLM_CODE_MAX_TOKENS = int(os.environ.get("SN17_CODE_MAX_TOKENS", "6000"))
 
 _MINER_REFERENCE_ROOT = Path(__file__).resolve().parent.parent
 _AGENTS_MD_PATH = _MINER_REFERENCE_ROOT / "AGENTS.md"
@@ -28,19 +35,34 @@ _state = {"vlm": None, "vlm_processor": None, "code_model": None, "code_tokenize
 
 
 def load_models() -> None:
-    """Load VLM once. Call during pod warmup.
-    NOTE: code-LLM (Qwen3.6-35B-A3B-NVFP4) is served separately via vLLM
-    (see VLLM_ENDPOINT) -- not loaded here. Start that server independently:
-      vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4 \
-        --reasoning-parser qwen3 \
-        --default-chat-template-kwargs '{"enable_thinking": false}'
+    """No models are loaded in-process.
+
+    Both pipeline stages call the shared vLLM server (see LLM_ENDPOINT), which
+    is already running and serves the rest of the stack. This call only
+    verifies it is reachable so warmup fails loudly rather than at round time.
     """
-    logger.info(f"Loading VLM: {VLM_MODEL_ID}")
-    _state["vlm_processor"] = AutoProcessor.from_pretrained(VLM_MODEL_ID, revision=VLM_MODEL_REVISION)
-    _state["vlm"] = Qwen2VLForConditionalGeneration.from_pretrained(
-        VLM_MODEL_ID, revision=VLM_MODEL_REVISION, torch_dtype=torch.bfloat16, device_map="cuda"
-    )
-    logger.info("VLM loaded and ready (code-LLM served via vLLM separately)")
+    base = LLM_ENDPOINT.rsplit("/v1/", 1)[0] + "/v1/models"
+    try:
+        served = [m["id"] for m in requests.get(base, timeout=10).json()["data"]]
+    except Exception as exc:
+        raise RuntimeError(f"Shared LLM not reachable at {base}: {exc}") from exc
+    if LLM_MODEL_NAME not in served:
+        raise RuntimeError(f"Model {LLM_MODEL_NAME!r} not served at {base}; has: {served}")
+    logger.info(f"Using shared LLM {LLM_MODEL_NAME} at {LLM_ENDPOINT} for vision + code")
+
+
+def _chat(messages: list, max_tokens: int, temperature: float) -> str:
+    """One call into the shared vLLM server, thinking disabled."""
+    payload = {
+        "model": LLM_MODEL_NAME,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    resp = requests.post(LLM_ENDPOINT, json=payload, timeout=240)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
 
 def _download_image(url: str) -> Image.Image:
@@ -51,7 +73,7 @@ def _download_image(url: str) -> Image.Image:
 
 
 def _analyze_image(image: Image.Image) -> str:
-    """VLM pass: describe the object's structure for the code LLM."""
+    """Vision pass on the shared LLM: describe structure for the code stage."""
     prompt_text = (
         "Describe this 3D object's structure for someone reconstructing it "
         "from geometric primitives (boxes, cylinders, spheres, cones, tori, "
@@ -61,23 +83,17 @@ def _analyze_image(image: Image.Image) -> str:
         "symmetry or repeated elements. Do not mention textures beyond "
         "solid colors. Keep it factual and structured, under 300 words."
     )
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": prompt_text},
-            ],
-        }
+    shrunk = image.copy()
+    shrunk.thumbnail((LLM_MAX_IMAGE_PX, LLM_MAX_IMAGE_PX))
+    buf = io.BytesIO()
+    shrunk.save(buf, format="PNG")
+    data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    content = [
+        {"type": "image_url", "image_url": {"url": data_url}},
+        {"type": "text", "text": prompt_text},
     ]
-    processor = _state["vlm_processor"]
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = processor(text=[text], images=[image], return_tensors="pt").to("cuda")
-    with torch.no_grad():
-        output_ids = _state["vlm"].generate(**inputs, max_new_tokens=500)
-    generated = output_ids[:, inputs["input_ids"].shape[1]:]
-    description = processor.batch_decode(generated, skip_special_tokens=True)[0]
-    return description.strip()
+    return _chat([{"role": "user", "content": content}], max_tokens=500, temperature=0.3).strip()
 
 
 def _extract_js_code(text: str) -> str:
@@ -104,9 +120,6 @@ def _extract_js_code(text: str) -> str:
     logger.warning("No fence or code keyword found -- returning raw text as last resort")
     return text.strip()
 
-
-VLLM_ENDPOINT = "http://localhost:8000/v1/chat/completions"
-VLLM_MODEL_NAME = "unsloth/Qwen3.6-35B-A3B-NVFP4"
 
 def _generate_code(description: str, seed: int, feedback: str | None = None) -> str:
     """Code-LLM pass: structural description -> generate.js source.
@@ -137,19 +150,14 @@ def _generate_code(description: str, seed: int, feedback: str | None = None) -> 
             f"corrected module."
         )
 
-    payload = {
-        "model": VLLM_MODEL_NAME,
-        "messages": [
+    response = _chat(
+        [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "max_tokens": 2000,
-        "temperature": 0.3,
-    }
-
-    resp = requests.post(VLLM_ENDPOINT, json=payload, timeout=120)
-    resp.raise_for_status()
-    response = resp.json()["choices"][0]["message"]["content"]
+        max_tokens=LLM_CODE_MAX_TOKENS,
+        temperature=0.3,
+    )
     return _extract_js_code(response)
 
 
