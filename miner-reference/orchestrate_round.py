@@ -3,12 +3,14 @@ fetches prompts, runs generation, uploads to R2, commits on-chain.
 """
 import json
 import time
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import requests
-import bittensor as bt
+# bittensor imported function-locally (see below): keeps this module
+# importable from the torch-free generation venv, which has no bittensor.
 
 STATE_URL = "https://raw.githubusercontent.com/404-Repo/404-active-competition/main/state.json"
 ROUND_URL_TMPL = "https://raw.githubusercontent.com/404-Repo/404-active-competition/main/rounds/{round}/{file}"
@@ -38,13 +40,50 @@ def get_round_file(round_num: int, filename: str) -> requests.Response:
 
 
 def get_latest_commit_sha() -> str:
-    """Get the current HEAD commit SHA of this local git repo."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=MINER_REF_DIR.parent,  # repo root, not miner-reference/
+    """HEAD commit SHA of this local repo, verified to exist on the remote.
+
+    The on-chain payload pins this SHA and judges fetch {repo}@{commit} from
+    GitHub. A SHA that was never pushed makes the submission unverifiable, so
+    refuse to hand one back rather than commit a dangling reference.
+    Override with SN17_ALLOW_UNPUSHED_SHA=1 only if you know why.
+    """
+    root = MINER_REF_DIR.parent
+    sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=root,
         capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    if os.environ.get("SN17_ALLOW_UNPUSHED_SHA") == "1":
+        return sha
+
+    # cheap, offline: is the SHA an ancestor of any remote-tracking ref?
+    on_remote = subprocess.run(
+        ["git", "branch", "-r", "--contains", sha], cwd=root,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if on_remote:
+        return sha
+
+    # remote-tracking refs may just be stale -- ask the remote directly
+    subprocess.run(["git", "fetch", "-q", "origin"], cwd=root,
+                   capture_output=True, text=True)
+    on_remote = subprocess.run(
+        ["git", "branch", "-r", "--contains", sha], cwd=root,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if on_remote:
+        return sha
+
+    # NOT fatal: a missed commit scores zero for certain, whereas a dangling
+    # SHA only risks the verification step. Commit anyway, loudly.
+    print(
+        f"[orchestrate] WARNING: SHA {sha[:9]} is not reachable from any remote "
+        f"branch of {GITHUB_REPO}. Committing anyway so the round is not lost, "
+        f"but judges cannot fetch the repo at that commit until it is pushed "
+        f"(git push origin HEAD). The sn17-observer alerts on this.",
+        flush=True,
     )
-    return result.stdout.strip()
+    return sha
 
 
 def wait_for_miner_generation_stage() -> int:
@@ -116,6 +155,7 @@ def upload_all(results: dict, round_num: int) -> str:
 
 def wait_for_reveal_window(round_num: int) -> None:
     """Block until current chain height is within the round's reveal window."""
+    import bittensor as bt  # local: module must import without bittensor
     schedule_resp = get_round_file(round_num, "schedule.json")
     schedule_resp.raise_for_status()
     schedule = schedule_resp.json()
@@ -140,6 +180,7 @@ def wait_for_reveal_window(round_num: int) -> None:
 
 def commit_submission(commit_sha: str, cdn_url: str) -> None:
     """Post the on-chain commitment with repo, commit SHA, and CDN URL."""
+    import bittensor as bt  # local: module must import without bittensor
     wallet = bt.wallet(name=WALLET_NAME, hotkey=WALLET_HOTKEY)
     subtensor = bt.subtensor(network=NETWORK)
 
@@ -241,6 +282,7 @@ def main():
 
 
 def _process_one_round(round_num, args):
+    import bittensor as bt  # local: module must import without bittensor
     # PRE-FLIGHT CHECK: verify the reveal window is genuinely open and has
     # meaningful time remaining BEFORE starting a ~2.5 hour generation run.
     # Round 33 cost us: generation succeeded, but the reveal window had

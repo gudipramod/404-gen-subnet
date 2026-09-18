@@ -19,6 +19,11 @@ from loguru import logger
 # separate VLM is loaded here: no local weights, no extra VRAM, no second model.
 LLM_ENDPOINT = os.environ.get("SN17_LLM_ENDPOINT", "http://127.0.0.1:8000/v1/chat/completions")
 LLM_MODEL_NAME = os.environ.get("SN17_LLM_MODEL", "qwen3.6-35b")
+# The code stage may live on a second server. Locally both default to the one
+# shared tier; inside the verification image they are two bundled vLLM servers
+# (the pod cannot reach our cluster, so it must carry its own models).
+LLM_CODE_ENDPOINT = os.environ.get("SN17_CODE_ENDPOINT", LLM_ENDPOINT)
+LLM_CODE_MODEL = os.environ.get("SN17_CODE_MODEL", LLM_MODEL_NAME)
 LLM_MAX_IMAGE_PX = 768  # downscale before send; keeps prompt tokens sane
 # 2000 truncated complex objects mid-file (finish_reason=length -> PARSE_ERROR).
 # Measured: a compliant SUV/clock module needs ~3.4k tokens.
@@ -41,26 +46,31 @@ def load_models() -> None:
     is already running and serves the rest of the stack. This call only
     verifies it is reachable so warmup fails loudly rather than at round time.
     """
-    base = LLM_ENDPOINT.rsplit("/v1/", 1)[0] + "/v1/models"
-    try:
-        served = [m["id"] for m in requests.get(base, timeout=10).json()["data"]]
-    except Exception as exc:
-        raise RuntimeError(f"Shared LLM not reachable at {base}: {exc}") from exc
-    if LLM_MODEL_NAME not in served:
-        raise RuntimeError(f"Model {LLM_MODEL_NAME!r} not served at {base}; has: {served}")
-    logger.info(f"Using shared LLM {LLM_MODEL_NAME} at {LLM_ENDPOINT} for vision + code")
+    for label, ep, want in (
+        ("vision", LLM_ENDPOINT, LLM_MODEL_NAME),
+        ("code", LLM_CODE_ENDPOINT, LLM_CODE_MODEL),
+    ):
+        base = ep.rsplit("/v1/", 1)[0] + "/v1/models"
+        try:
+            served = [m["id"] for m in requests.get(base, timeout=10).json()["data"]]
+        except Exception as exc:
+            raise RuntimeError(f"{label} LLM not reachable at {base}: {exc}") from exc
+        if want not in served:
+            raise RuntimeError(f"{label} model {want!r} not served at {base}; has: {served}")
+        logger.info(f"{label}: {want} @ {ep}")
 
 
-def _chat(messages: list, max_tokens: int, temperature: float) -> str:
-    """One call into the shared vLLM server, thinking disabled."""
+def _chat(messages: list, max_tokens: int, temperature: float,
+          endpoint: str | None = None, model: str | None = None) -> str:
+    """One OpenAI-compatible chat call, thinking disabled."""
     payload = {
-        "model": LLM_MODEL_NAME,
+        "model": model or LLM_MODEL_NAME,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    resp = requests.post(LLM_ENDPOINT, json=payload, timeout=240)
+    resp = requests.post(endpoint or LLM_ENDPOINT, json=payload, timeout=240)
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"]
 
@@ -157,6 +167,8 @@ def _generate_code(description: str, seed: int, feedback: str | None = None) -> 
         ],
         max_tokens=LLM_CODE_MAX_TOKENS,
         temperature=0.3,
+        endpoint=LLM_CODE_ENDPOINT,
+        model=LLM_CODE_MODEL,
     )
     return _extract_js_code(response)
 

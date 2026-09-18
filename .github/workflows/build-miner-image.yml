@@ -1,0 +1,46 @@
+name: build-miner-image
+
+# The miner is developed on aarch64/Blackwell but VERIFIED on amd64/Hopper.
+# Building here is what makes the submitted image match the pod it runs on;
+# it cannot be built correctly on the development nodes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'miner-reference/**'
+      - '.github/workflows/build-miner-image.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space for the baked models
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: miner-reference/docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/miner:${{ github.sha }}
+            ghcr.io/${{ github.repository }}/miner:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
