@@ -23,17 +23,18 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY miner-reference/validator/package.json miner-reference/validator/package-lock.json ./validator/
 RUN cd validator && npm ci --omit=dev
 
-# Bake the models in: the 4h ready budget covers warmup, and a cold 30GB pull at
-# pod start is the difference between ready and burned budget. Revisions pinned
-# per the reproducibility requirement. Both are Apache-2.0 and bf16 on Hopper.
-ENV HF_HUB_DISABLE_TELEMETRY=1
-RUN pip install --no-cache-dir "huggingface_hub[cli]==1.23.0" \
- && hf download Qwen/Qwen2-VL-7B-Instruct \
-      --revision eed13092ef92e448dd6875b2a00151bd3f7db0ac \
-      --local-dir /models/qwen2-vl-7b-instruct \
- && hf download Qwen/Qwen2.5-Coder-14B-Instruct \
-      --revision aedcc2d42b622764e023cf882b6652e646b95671 \
-      --local-dir /models/qwen2.5-coder-14b-instruct
+# Models are NOT baked in. Baking ~30GB onto the vLLM base exhausted the GitHub
+# runner's disk (build killed at 44min). The spec counts model downloads inside
+# the 4h ready budget -- "image pull is not counted, but model downloads and
+# warm-up are" -- so the entrypoint fetches them at pod start, where bandwidth
+# is real. Revisions stay pinned for reproducibility.
+ENV HF_HUB_DISABLE_TELEMETRY=1 \
+    HF_HOME=/models/hf \
+    SN17_VISION_REPO=Qwen/Qwen2-VL-7B-Instruct \
+    SN17_VISION_REV=eed13092ef92e448dd6875b2a00151bd3f7db0ac \
+    SN17_CODE_REPO=Qwen/Qwen2.5-Coder-14B-Instruct \
+    SN17_CODE_REV=aedcc2d42b622764e023cf882b6652e646b95671
+RUN pip install --no-cache-dir "huggingface_hub[cli]==1.23.0"
 
 COPY miner-reference/ ./
 RUN chmod +x docker/entrypoint.sh

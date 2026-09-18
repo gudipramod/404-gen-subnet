@@ -10,6 +10,17 @@ set -euo pipefail
 VISION_MODEL=${SN17_VISION_MODEL_PATH:-/models/qwen2-vl-7b-instruct}
 CODE_MODEL=${SN17_CODE_MODEL_PATH:-/models/qwen2.5-coder-14b-instruct}
 
+# Fetch the pinned weights if they are not already present. Counted inside the
+# 4h ready budget; pinned by revision so the build stays reproducible.
+fetch() {  # fetch <repo> <revision> <dest>
+  [ -f "$3/config.json" ] && { echo "[entrypoint] $3 already present"; return 0; }
+  echo "[entrypoint] downloading $1@${2:0:9} -> $3"
+  hf download "$1" --revision "$2" --local-dir "$3" \
+    || { echo "[entrypoint] FATAL: download of $1 failed"; exit 1; }
+}
+fetch "${SN17_VISION_REPO}" "${SN17_VISION_REV}" "$VISION_MODEL"
+fetch "${SN17_CODE_REPO}"   "${SN17_CODE_REV}"   "$CODE_MODEL"
+
 echo "[entrypoint] starting vision server (:8000)"
 python3 -m vllm.entrypoints.openai.api_server \
   --model "$VISION_MODEL" --served-model-name vision \
